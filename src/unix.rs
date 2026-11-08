@@ -35,9 +35,8 @@ impl Door {
 			// Held by this thread, which lives as long as the process, so the lock does too.
 			let Self { lock: _lock, listener } = self;
 			for stream in listener.incoming().flatten() {
-				if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
-					continue;
-				}
+				// macOS refuses this once the other copy has closed its end, which a quick one already has, and then the read can't hang anyway.
+				let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
 				let mut bytes = Vec::new();
 				let limit = u64::try_from(message::MAX_BYTES).unwrap_or(u64::MAX) + 1;
 				if stream.take(limit).read_to_end(&mut bytes).is_ok()
