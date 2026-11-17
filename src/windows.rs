@@ -2,13 +2,20 @@
 //!
 //! The pipe's default security lets only the same user, and administrators, write to it, and it refuses connections from other computers. Its name includes the user's name, so two users' copies don't meet.
 
-use std::{env, ffi::OsStr, io, iter, os::windows::ffi::OsStrExt as _, thread};
+use std::{
+	env,
+	ffi::OsStr,
+	io, iter,
+	os::windows::ffi::OsStrExt as _,
+	thread,
+	time::{Duration, Instant},
+};
 
 use windows::{
 	Win32::{
 		Foundation::{
 			CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-			GENERIC_WRITE, GetLastError, HANDLE, WIN32_ERROR,
+			ERROR_SEM_TIMEOUT, GENERIC_WRITE, GetLastError, HANDLE, WIN32_ERROR,
 		},
 		Storage::FileSystem::{
 			CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, FlushFileBuffers,
@@ -26,8 +33,11 @@ use windows::{
 use crate::{Ring, message};
 
 const BUFFER: u32 = 64 * 1024;
-/// How long a second copy waits for a busy first copy, in milliseconds.
-const WAIT_MS: u32 = 5000;
+/// How long a second copy waits, in all, for a busy first copy. A first copy that answers is never busy for longer
+/// than it takes to read another copy's message, but one stuck partway through exiting holds its pipe busy for good,
+/// and Windows keeps saying it's about to be free, so waiting on each of those answers once held startup up for
+/// minutes.
+const WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct Door {
@@ -118,14 +128,18 @@ pub fn ring(name: &str, message: &[u8]) -> io::Result<Ring> {
 fn deliver(path: PCWSTR, message: &[u8]) -> Result<(), WIN32_ERROR> {
 	// Windows only lets the process the user is using bring a window to the front, so this one passes that on to the first copy.
 	let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+	let deadline = Instant::now() + WAIT;
 	let pipe = loop {
 		match unsafe {
 			CreateFileW(path, GENERIC_WRITE.0, FILE_SHARE_NONE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
 		} {
 			Ok(pipe) => break pipe,
 			Err(error) if code(&error) == ERROR_PIPE_BUSY => {
-				if !unsafe { WaitNamedPipeW(path, WAIT_MS) }.as_bool() {
-					return Err(unsafe { GetLastError() });
+				let left = deadline.saturating_duration_since(Instant::now());
+				// At least a millisecond, since zero asks for the pipe's own default wait.
+				let left_ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
+				if left.is_zero() || !unsafe { WaitNamedPipeW(path, left_ms) }.as_bool() {
+					return Err(ERROR_SEM_TIMEOUT);
 				}
 			}
 			Err(error) => return Err(code(&error)),
