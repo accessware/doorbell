@@ -6,7 +6,8 @@ use std::{
 	env,
 	ffi::OsStr,
 	io, iter,
-	os::windows::ffi::OsStrExt as _,
+	os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
+	sync::mpsc,
 	thread,
 	time::{Duration, Instant},
 };
@@ -21,9 +22,12 @@ use windows::{
 			CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, FlushFileBuffers,
 			OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
 		},
-		System::Pipes::{
-			ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-			PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+		System::{
+			IO::CancelSynchronousIo,
+			Pipes::{
+				ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+				PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+			},
 		},
 		UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow},
 	},
@@ -38,6 +42,9 @@ const BUFFER: u32 = 64 * 1024;
 /// and Windows keeps saying it's about to be free, so waiting on each of those answers once held startup up for
 /// minutes.
 const WAIT: Duration = Duration::from_secs(1);
+/// How long a second copy waits for the first to read its message. One that's connected but never reads, such as one
+/// stuck exiting after its listening thread has gone, otherwise kept the second copy waiting for good.
+const READ_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct Door {
@@ -145,24 +152,47 @@ fn deliver(path: PCWSTR, message: &[u8]) -> Result<(), WIN32_ERROR> {
 			Err(error) => return Err(code(&error)),
 		}
 	};
+	let result = send(pipe, message);
+	let _ = unsafe { CloseHandle(pipe) };
+	result
+}
+
+/// Writes `message` and waits for the first copy to read it, giving up after [`READ_WAIT`].
+fn send(pipe: HANDLE, message: &[u8]) -> Result<(), WIN32_ERROR> {
+	let raw = pipe.0 as usize;
+	let message = message.to_vec();
+	let (done, finished) = mpsc::channel();
+	let writer = thread::spawn(move || {
+		let _ = done.send(write_all(HANDLE(raw as *mut _), &message));
+	});
+	if let Ok(result) = finished.recv_timeout(READ_WAIT) {
+		let _ = writer.join();
+		return result;
+	}
+	// Cancelling before the writer has started its write finds nothing to cancel, so this keeps at it until the writer
+	// is done.
+	let thread = HANDLE(writer.as_raw_handle());
+	for _ in 0..100 {
+		let _ = unsafe { CancelSynchronousIo(thread) };
+		if finished.recv_timeout(Duration::from_millis(10)).is_ok() {
+			let _ = writer.join();
+			break;
+		}
+	}
+	Err(ERROR_SEM_TIMEOUT)
+}
+
+fn write_all(pipe: HANDLE, message: &[u8]) -> Result<(), WIN32_ERROR> {
 	let mut written = 0;
-	let mut result = Ok(());
 	while written < message.len() {
 		let mut count = 0;
 		if let Err(error) = unsafe { WriteFile(pipe, Some(&message[written..]), Some(&raw mut count), None) } {
-			result = Err(code(&error));
-			break;
+			return Err(code(&error));
 		}
 		written += count as usize;
 	}
 	// Waits until the first copy has read it all, since closing first could lose the end of it.
-	if result.is_ok()
-		&& let Err(error) = unsafe { FlushFileBuffers(pipe) }
-	{
-		result = Err(code(&error));
-	}
-	let _ = unsafe { CloseHandle(pipe) };
-	result
+	unsafe { FlushFileBuffers(pipe) }.map_err(|error| code(&error))
 }
 
 fn code(error: &windows::core::Error) -> WIN32_ERROR {

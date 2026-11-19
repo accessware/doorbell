@@ -39,3 +39,21 @@ fn a_name_that_would_leave_its_folder_is_refused() {
 	assert!(doorbell::ring("../escape", &[] as &[&str]).is_err());
 	assert!(doorbell::ring("", &[] as &[&str]).is_err());
 }
+
+/// A first copy partway through exiting can still have its door but no longer listen. The second copy has to give up
+/// rather than wait on it for good. Only on Windows, since on Unix a short message fits in the socket's buffer, which
+/// can't be told apart from being read.
+#[cfg(windows)]
+#[test]
+fn a_second_copy_gives_up_on_a_first_that_never_reads() {
+	let name = name("deaf");
+	let Ring::First(_door) = doorbell::ring(&name, &[] as &[&str]).unwrap() else {
+		panic!("the first copy wasn't first")
+	};
+	let (sender, receiver) = mpsc::channel();
+	std::thread::spawn(move || {
+		sender.send(doorbell::ring(&name, &["hello"]).map(|ring| matches!(ring, Ring::Delivered)))
+	});
+	let result = receiver.recv_timeout(Duration::from_secs(30)).expect("the second copy waited for good");
+	assert!(result.is_err(), "a message nobody read was taken as delivered");
+}

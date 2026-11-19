@@ -68,6 +68,9 @@ pub fn ring(name: &str, message: &[u8]) -> io::Result<Ring> {
 	}
 }
 
+/// How long a second copy waits for the first to take its message.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn deliver(socket: &Path, message: &[u8]) -> io::Result<()> {
 	let mut attempts = 0;
 	let mut stream = loop {
@@ -80,6 +83,8 @@ fn deliver(socket: &Path, message: &[u8]) -> io::Result<()> {
 			Err(error) => return Err(error),
 		}
 	};
+	// A message bigger than the socket's buffer otherwise waits for good on a first copy that never reads it.
+	stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 	stream.write_all(message)
 }
 
